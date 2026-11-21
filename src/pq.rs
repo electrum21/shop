@@ -115,20 +115,19 @@ impl Writer {
             let mut page: Vec<u8> = Vec::new();
             let nvals = nrows;
             match c {
-                Col::I32(v) => {
-                    page.reserve(v.len() * 4);
-                    for x in v.iter() {
-                        page.extend_from_slice(&x.to_le_bytes());
-                    }
-                }
-                Col::I64(v) => {
-                    page.reserve(v.len() * 8);
-                    for x in v.iter() {
-                        page.extend_from_slice(&x.to_le_bytes());
-                    }
-                }
+                // little-endian target: plain encoding is the in-memory layout
+                Col::I32(v) => page.extend_from_slice(unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }),
+                Col::I64(v) => page.extend_from_slice(unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8) }),
                 Col::Str(v) => {
-                    for s in v.iter() {
+                    let tot: usize = v.iter().map(|s| s.len() + 4).sum();
+                    page.reserve(tot);
+                    for (i, s) in v.iter().enumerate() {
+                        // strings may be scattered over the input mappings: prefetch ahead
+                        if i + 16 < v.len() {
+                            unsafe {
+                                std::arch::x86_64::_mm_prefetch(v[i + 16].as_ptr() as *const i8, std::arch::x86_64::_MM_HINT_T0)
+                            };
+                        }
                         page.extend_from_slice(&(s.len() as u32).to_le_bytes());
                         page.extend_from_slice(s);
                     }
@@ -169,6 +168,7 @@ impl Writer {
             h.stop();
             h.stop();
             let offset = self.buf.len() as i64;
+            self.buf.reserve(h.0.len() + page.len());
             self.buf.extend_from_slice(&h.0);
             self.buf.extend_from_slice(&page);
             chunks.push(ChunkInfo {
