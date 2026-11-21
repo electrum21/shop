@@ -7,6 +7,10 @@ pub enum Col<'a> {
     Str(&'a [&'a [u8]]),
     /// Optional string column: None = null
     OptStr(&'a [Option<&'a [u8]>]),
+    /// Required string column given as packed refs (ptr | len << 48)
+    Refs(&'a [u64]),
+    /// Optional string column given as indexes into a name table (u16::MAX = null)
+    OptIdx(&'a [u16], &'a [Vec<u8>]),
 }
 
 pub struct Field {
@@ -99,6 +103,7 @@ struct ChunkInfo {
 
 pub struct Writer {
     pub buf: Vec<u8>,
+    page: Vec<u8>,
     fields: Vec<Field>,
     groups: Vec<(Vec<ChunkInfo>, i64)>, // chunks, num_rows
     num_rows: i64,
@@ -106,13 +111,17 @@ pub struct Writer {
 
 impl Writer {
     pub fn new(fields: Vec<Field>) -> Self {
-        Writer { buf: b"PAR1".to_vec(), fields, groups: vec![], num_rows: 0 }
+        Writer { buf: b"PAR1".to_vec(), page: Vec::new(), fields, groups: vec![], num_rows: 0 }
+    }
+    pub fn reserve(&mut self, bytes: usize) {
+        self.buf.reserve(bytes);
     }
 
     pub fn row_group(&mut self, cols: &[Col], nrows: usize) {
         let mut chunks = vec![];
         for (f, c) in self.fields.iter().zip(cols) {
-            let mut page: Vec<u8> = Vec::new();
+            let mut page = std::mem::take(&mut self.page);
+            page.clear();
             let nvals = nrows;
             match c {
                 // little-endian target: plain encoding is the in-memory layout
@@ -130,6 +139,42 @@ impl Writer {
                         }
                         page.extend_from_slice(&(s.len() as u32).to_le_bytes());
                         page.extend_from_slice(s);
+                    }
+                }
+                Col::Refs(v) => {
+                    let tot: usize = v.iter().map(|&r| (r >> 48) as usize + 4).sum();
+                    page.reserve(tot);
+                    for (i, &r) in v.iter().enumerate() {
+                        if i + 16 < v.len() {
+                            unsafe {
+                                std::arch::x86_64::_mm_prefetch((v[i + 16] & 0xFFFF_FFFF_FFFF) as *const i8, std::arch::x86_64::_MM_HINT_T0)
+                            };
+                        }
+                        let l = (r >> 48) as usize;
+                        let sl = unsafe { std::slice::from_raw_parts((r & 0xFFFF_FFFF_FFFF) as *const u8, l) };
+                        page.extend_from_slice(&(l as u32).to_le_bytes());
+                        page.extend_from_slice(sl);
+                    }
+                }
+                Col::OptIdx(v, names) => {
+                    let groups = (v.len() + 7) / 8;
+                    let mut lv = Tw(Vec::new());
+                    lv.varint(((groups as u64) << 1) | 1);
+                    let mut bytes = vec![0u8; groups];
+                    for (i, &t) in v.iter().enumerate() {
+                        if t != u16::MAX {
+                            bytes[i / 8] |= 1 << (i % 8);
+                        }
+                    }
+                    lv.0.extend_from_slice(&bytes);
+                    page.extend_from_slice(&(lv.0.len() as u32).to_le_bytes());
+                    page.extend_from_slice(&lv.0);
+                    for &t in v.iter() {
+                        if t != u16::MAX {
+                            let s = &names[t as usize];
+                            page.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                            page.extend_from_slice(s);
+                        }
                     }
                 }
                 Col::OptStr(v) => {
@@ -176,6 +221,7 @@ impl Writer {
                 total: (h.0.len() + page.len()) as i64,
                 num_values: nvals as i64,
             });
+            self.page = page;
         }
         self.num_rows += nrows as i64;
         self.groups.push((chunks, nrows as i64));
