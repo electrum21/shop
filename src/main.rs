@@ -349,20 +349,23 @@ fn parse_ts(f: &[u8], c: &mut DCache) -> Option<i64> {
 }
 /// `ingest_ts` is always valid F1 (rules); take the lean path for that shape.
 #[inline(always)]
-fn parse_ingest(f: &[u8], c: &mut DCache) -> Option<i64> {
+/// Returns (milliseconds, whole seconds floored).
+fn parse_ingest(f: &[u8], c: &mut DCache) -> Option<(i64, i64)> {
+    let slow = |f: &[u8], c: &mut DCache| parse_ts(f, c).map(|ms| (ms, if ms >= 0 { ms / 1000 } else { -1 }));
     if f.len() != 20 {
-        return parse_ts(f, c);
+        return slow(f, c);
     }
     let k1 = ld8(f, 0);
     let k2 = u16::from_le_bytes([unsafe { *f.get_unchecked(8) }, unsafe { *f.get_unchecked(9) }]);
     let idx = ((k1 ^ ((k2 as u64) << 3)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 57) as usize;
     if c.k1[idx] != k1 || c.k2[idx] != k2 {
-        return parse_ts(f, c);
+        return slow(f, c);
     }
     let t = ld8(f, 11) ^ 0x3030_3A30_303A_3030;
     let u = t.wrapping_mul(10).wrapping_add(t >> 8);
     let secs = (u & 0xFF) as i64 * 3600 + ((u >> 24) & 0xFF) as i64 * 60 + ((u >> 48) & 0xFF) as i64;
-    Some((c.days[idx] * 86_400 + secs) * 1000)
+    let sec = c.days[idx] * 86_400 + secs;
+    Some((sec * 1000, sec))
 }
 
 /// F1 `YYYY-MM-DDTHH:MM:SSZ` or F2 `YYYY-MM-DDTHH:MM:SS+HH:MM` (caller checked length 20/25).
@@ -699,10 +702,8 @@ impl PersonMap {
 /// Person key of a linked person: derived from its root's (canonical) name pointer.
 #[inline(always)]
 fn pkey_of_root(rf: u64) -> u64 {
-    let mut z = rf.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
+    let z = rf.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z ^ (z >> 29)
 }
 
 // ---------------------------------------------------------------- block pool
@@ -795,7 +796,6 @@ struct BW<T> {
     cur: *mut T,
     end: *mut T,
     n: u64,
-    k: usize,
     blocks: Vec<usize>,
 }
 unsafe impl<T> Send for BW<T> {}
@@ -805,16 +805,15 @@ impl<T: Copy> BW<T> {
     const LINES32: usize = std::mem::size_of::<T>() / 4; // 32-byte stores per flush of 8 records
     fn new() -> Self {
         assert!(std::mem::size_of::<T>() == 24 || std::mem::size_of::<T>() == 16);
-        BW { buf: unsafe { std::mem::zeroed() }, cur: std::ptr::null_mut(), end: std::ptr::null_mut(), n: 0, k: 0, blocks: Vec::new() }
+        BW { buf: unsafe { std::mem::zeroed() }, cur: std::ptr::null_mut(), end: std::ptr::null_mut(), n: 0, blocks: Vec::new() }
     }
     #[inline(always)]
     fn push(&mut self, v: T, pool: &Pool) {
         unsafe {
-            *self.buf.get_unchecked_mut(self.k) = v;
+            *self.buf.get_unchecked_mut((self.n & 7) as usize) = v;
         }
-        self.k += 1;
         self.n += 1;
-        if self.k == 8 {
+        if self.n & 7 == 0 {
             self.flush_line(pool);
         }
     }
@@ -831,7 +830,6 @@ impl<T: Copy> BW<T> {
             }
             self.cur = self.cur.add(8);
         }
-        self.k = 0;
     }
     #[cold]
     #[inline(never)]
@@ -843,15 +841,15 @@ impl<T: Copy> BW<T> {
     }
     /// Write out the staged tail (normal stores). Call once when done pushing.
     fn finish(&mut self, pool: &Pool) {
-        if self.k > 0 {
+        let k = (self.n & 7) as usize;
+        if k > 0 {
             if self.cur == self.end {
                 self.grow(pool);
             }
             unsafe {
-                std::ptr::copy_nonoverlapping(self.buf.as_ptr(), self.cur, self.k);
-                self.cur = self.cur.add(self.k);
+                std::ptr::copy_nonoverlapping(self.buf.as_ptr(), self.cur, k);
+                self.cur = self.cur.add(k);
             }
-            self.k = 0;
         }
     }
     fn len(&self) -> usize {
@@ -948,11 +946,12 @@ fn parse_event(f: &[&'static [u8]; 7], ctx: &Ctx, w: &mut W1) {
         return;
     }
     let eid = h64(eidb);
-    let ing_ms = parse_ingest(f[3], &mut w.dc);
-    let ingest = match ing_ms {
-        Some(v) if v >= 0 => (v / 1000).min(u32::MAX as i64 - 1) as u32,
+    let ing = parse_ingest(f[3], &mut w.dc);
+    let ingest = match ing {
+        Some((_, sec)) if sec >= 0 => sec.min(u32::MAX as i64 - 1) as u32,
         _ => u32::MAX,
     };
+    let ing_ms = ing.map(|x| x.0);
     'v: {
         let uidb = f[1];
         if uidb.is_empty() {
@@ -962,11 +961,20 @@ fn parse_event(f: &[&'static [u8]; 7], ctx: &Ctx, w: &mut W1) {
         if ts < ctx.ws || ts >= ctx.we {
             break 'v;
         }
-        let kind = match f[4] {
-            b"view" => 0u64,
-            b"cart" => 1,
-            b"purchase" => 2,
-            _ => break 'v,
+        let ty = f[4];
+        let kind = if ty.len() == 4 {
+            let x = u32::from_le_bytes(unsafe { (ty.as_ptr() as *const [u8; 4]).read_unaligned() });
+            if x == u32::from_le_bytes(*b"view") {
+                0u64
+            } else if x == u32::from_le_bytes(*b"cart") {
+                1
+            } else {
+                break 'v;
+            }
+        } else if ty.len() == 8 && ld8(ty, 0) == u64::from_le_bytes(*b"purchase") {
+            2
+        } else {
+            break 'v;
         };
         if f[5].is_empty() {
             break 'v;
@@ -1466,9 +1474,21 @@ fn main() {
     {
         let all: Vec<Bytes> = lk_files.iter().chain(ev_files.iter()).chain(ck_files.iter()).copied().collect();
         thread::spawn(move || {
+            // only for ranges not already in the page cache (mincore is cheap; WILLNEED on cached
+            // pages still costs ~1us per page)
+            const STEP: usize = 4 << 20;
+            let mut vec = vec![0u8; STEP / 4096 + 1];
             for d in all {
-                if !d.is_empty() {
-                    unsafe { libc::madvise(d.as_ptr() as *mut libc::c_void, d.len(), libc::MADV_WILLNEED) };
+                let mut off = 0;
+                while off < d.len() {
+                    let len = STEP.min(d.len() - off);
+                    let p = unsafe { d.as_ptr().add(off) };
+                    let r = unsafe { libc::mincore(p as *mut libc::c_void, len, vec.as_mut_ptr()) };
+                    let pages = (len + 4095) / 4096;
+                    if r != 0 || vec[..pages].iter().any(|&b| b & 1 == 0) {
+                        unsafe { libc::madvise(p as *mut libc::c_void, len, libc::MADV_WILLNEED) };
+                    }
+                    off += len;
                 }
             }
         });
@@ -1501,7 +1521,7 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let total_edges: usize = edges.iter().map(|v| v.len()).sum();
-    let links = LinkTable::new(total_edges * 3);
+    let links = LinkTable::new(total_edges * 2 + 16);
     let next = AtomicUsize::new(0);
     let nkeys = AtomicUsize::new(0);
     thread::scope(|sc| {
@@ -1750,11 +1770,12 @@ fn main() {
                         cnt.clear();
                         cnt.resize(nsb + 1, 0);
                         for (wid, w) in w1s.iter().enumerate() {
-                            let words = &lose[wid][loff[wid][b]..];
+                            // stage 2 is joined: read the bitmaps as plain words
+                            let words: &[u64] = unsafe { std::mem::transmute::<&[AtomicU64], &[u64]>(&lose[wid][loff[wid][b]..]) };
                             let mut idx = 0usize;
                             w.pe[b].for_slices(|sl| {
                                 for r in sl {
-                                    let keep = ((words[idx >> 6].load(Relaxed) >> (idx & 63)) & 1) ^ 1;
+                                    let keep = ((unsafe { *words.get_unchecked(idx >> 6) } >> (idx & 63)) & 1) ^ 1;
                                     cnt[(r.pkey >> sh) as usize] += keep as u32;
                                     idx += 1;
                                 }
@@ -1776,11 +1797,12 @@ fn main() {
                         pos.clear();
                         pos.extend_from_slice(&cnt);
                         for (wid, w) in w1s.iter().enumerate() {
-                            let words = &lose[wid][loff[wid][b]..];
+                            // stage 2 is joined: read the bitmaps as plain words
+                            let words: &[u64] = unsafe { std::mem::transmute::<&[AtomicU64], &[u64]>(&lose[wid][loff[wid][b]..]) };
                             let mut idx = 0usize;
                             w.pe[b].for_slices(|sl| {
                                 for r in sl {
-                                    if (words[idx >> 6].load(Relaxed) >> (idx & 63)) & 1 == 0 {
+                                    if (unsafe { *words.get_unchecked(idx >> 6) } >> (idx & 63)) & 1 == 0 {
                                         let g = (r.pkey >> sh) as usize;
                                         let o = pos[g] as usize;
                                         unsafe {
@@ -1801,15 +1823,46 @@ fn main() {
                                 if pk[x + 1..y].iter().all(|&k| k == k0) {
                                     sort_u64(&mut pv[x..y]);
                                 } else {
+                                    // a few persons share this group: partition by person, then sort each
+                                    let mut keys = [0u64; 8];
+                                    let mut nk = 0;
+                                    let mut few = true;
+                                    for &k in &pk[x..y] {
+                                        if !keys[..nk].contains(&k) {
+                                            if nk == 8 {
+                                                few = false;
+                                                break;
+                                            }
+                                            keys[nk] = k;
+                                            nk += 1;
+                                        }
+                                    }
                                     tmp.clear();
                                     for i in x..y {
                                         tmp.push(PEv { pkey: pk[i], nref: nr[i], packed: pv[i] });
                                     }
-                                    tmp.sort_unstable_by(|a, b| (a.pkey, a.packed).cmp(&(b.pkey, b.packed)));
-                                    for (i, r) in tmp.iter().enumerate() {
-                                        pk[x + i] = r.pkey;
-                                        pv[x + i] = r.packed;
-                                        nr[x + i] = r.nref;
+                                    if few {
+                                        keys[..nk].sort_unstable();
+                                        let mut o = x;
+                                        for &k in &keys[..nk] {
+                                            let s0 = o;
+                                            for r in tmp.iter() {
+                                                if r.pkey == k {
+                                                    pk[o] = k;
+                                                    pv[o] = r.packed;
+                                                    nr[o] = r.nref;
+                                                    o += 1;
+                                                }
+                                            }
+                                            sort_u64(&mut pv[s0..o]);
+                                        }
+                                    } else {
+                                        tmp.sort_unstable_by(|a, b| (a.pkey, a.packed).cmp(&(b.pkey, b.packed)));
+                                        for (i, r) in tmp.iter().enumerate() {
+                                            pk[x + i] = r.pkey;
+                                            pv[x + i] = r.packed;
+                                            nr[x + i] = r.nref;
+                                        }
                                     }
                                 }
                             }
@@ -1847,7 +1900,13 @@ fn main() {
                         for g in 0..nsb {
                             let (x, y) = (cnt[g] as usize, cnt[g + 1] as usize);
                             if y - x > 1 {
-                                ck[x..y].sort_unstable_by(|a, b| (a.pkey, a.tc).cmp(&(b.pkey, b.tc)));
+                                let g = &mut ck[x..y];
+                                let k0 = g[0].pkey;
+                                if g.iter().all(|c| c.pkey == k0) {
+                                    g.sort_unstable_by_key(|c| c.tc);
+                                } else {
+                                    g.sort_unstable_by(|a, b| (a.pkey, a.tc).cmp(&(b.pkey, b.tc)));
+                                }
                             }
                         }
                         let (mut i, mut c) = (0usize, 0usize);
